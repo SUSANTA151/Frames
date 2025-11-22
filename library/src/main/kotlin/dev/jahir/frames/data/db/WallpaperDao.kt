@@ -9,6 +9,9 @@ import dev.jahir.frames.data.models.Wallpaper
 
 @Dao // Data Access Object
 interface WallpaperDao {
+    @Query("SELECT * FROM wallpapers WHERE url = :url")
+    suspend fun getWallpaperByUrl(url: String): Wallpaper?
+
     @Query("select * from wallpapers")
     fun getAllWallpapers(): List<Wallpaper>
 
@@ -27,4 +30,74 @@ interface WallpaperDao {
 
     @Query("delete from wallpapers")
     fun nuke()
+
+    @Query("""
+        SELECT * FROM wallpapers 
+        WHERE ROWID > (SELECT ROWID FROM wallpapers WHERE url = :currentUrl) 
+        ORDER BY ROWID ASC LIMIT 1
+    """)
+    suspend fun getNextWallpaper(currentUrl: String): Wallpaper?
+
+    @Query("""
+        SELECT * FROM wallpapers 
+        WHERE ROWID < (SELECT ROWID FROM wallpapers WHERE url = :currentUrl) 
+        ORDER BY ROWID DESC LIMIT 1
+    """)
+    suspend fun getPreviousWallpaper(currentUrl: String): Wallpaper?
+
+    @Query("SELECT * FROM wallpapers ORDER BY ROWID LIMIT 1")
+    suspend fun getFirstWallpaper(): Wallpaper?
+
+    @Query("SELECT * FROM wallpapers ORDER BY ROWID DESC LIMIT 1")
+    suspend fun getLastWallpaper(): Wallpaper?
+
+    @Query("""
+        SELECT * FROM wallpapers 
+        WHERE (
+            collections = :collection 
+            OR collections LIKE :collection || ',%'
+            OR collections LIKE '%,' || :collection || ',%'  
+            OR collections LIKE '%,' || :collection
+        )
+        AND ROWID > (SELECT ROWID FROM wallpapers WHERE url = :currentUrl) 
+        ORDER BY ROWID LIMIT 1
+    """)
+    suspend fun getNextWallpaperInCollection(currentUrl: String, collection: String): Wallpaper?
+
+    @Query("""
+        SELECT * FROM wallpapers 
+        WHERE (
+            collections = :collection 
+            OR collections LIKE :collection || ',%'
+            OR collections LIKE '%,' || :collection || ',%'  
+            OR collections LIKE '%,' || :collection
+        )
+        AND ROWID < (SELECT ROWID FROM wallpapers WHERE url = :currentUrl) 
+        ORDER BY ROWID DESC LIMIT 1
+    """)
+    suspend fun getPreviousWallpaperInCollection(currentUrl: String, collection: String): Wallpaper?
+
+    @Query("""
+        SELECT * FROM wallpapers 
+        WHERE (
+            collections = :collection 
+            OR collections LIKE :collection || ',%'
+            OR collections LIKE '%,' || :collection || ',%'  
+            OR collections LIKE '%,' || :collection
+        )
+        ORDER BY ROWID LIMIT 1
+    """)
+    suspend fun getFirstWallpaperInCollection(collection: String): Wallpaper?
+
+    @Query("""
+        SELECT * FROM wallpapers 
+        WHERE (
+            collections = :collection 
+            OR collections LIKE :collection || ',%'
+            OR collections LIKE '%,' || :collection || ',%'  
+            OR collections LIKE '%,' || :collection
+        )
+        ORDER BY ROWID DESC LIMIT 1
+    """)
+    suspend fun getLastWallpaperInCollection(collection: String): Wallpaper?
 }

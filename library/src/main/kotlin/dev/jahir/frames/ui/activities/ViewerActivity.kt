@@ -4,6 +4,7 @@ package dev.jahir.frames.ui.activities
 
 import android.Manifest
 import android.content.Intent
+import android.graphics.Color
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
 import android.os.Bundle
@@ -19,10 +20,14 @@ import android.view.WindowManager
 import android.widget.TextView
 import androidx.annotation.ColorInt
 import androidx.appcompat.app.AlertDialog
+import androidx.appcompat.widget.AppCompatImageButton
 import androidx.appcompat.widget.Toolbar
+import androidx.core.graphics.drawable.toDrawable
 import androidx.core.view.ViewCompat
 import androidx.fragment.app.DialogFragment
+import androidx.lifecycle.lifecycleScope
 import androidx.palette.graphics.Palette
+import coil.dispose
 import com.google.android.material.navigation.NavigationBarView
 import com.google.android.material.transition.platform.MaterialContainerTransform
 import com.google.android.material.transition.platform.MaterialContainerTransformSharedElementCallback
@@ -38,6 +43,7 @@ import dev.jahir.frames.extensions.context.firstInstallTime
 import dev.jahir.frames.extensions.context.isNetworkAvailable
 import dev.jahir.frames.extensions.context.isWifiConnected
 import dev.jahir.frames.extensions.context.navigationBarLight
+import dev.jahir.frames.extensions.context.resolveColor
 import dev.jahir.frames.extensions.context.statusBarLight
 import dev.jahir.frames.extensions.context.string
 import dev.jahir.frames.extensions.fragments.mdDialog
@@ -56,11 +62,13 @@ import dev.jahir.frames.extensions.views.setPaddingLeft
 import dev.jahir.frames.extensions.views.setPaddingRight
 import dev.jahir.frames.extensions.views.setPaddingTop
 import dev.jahir.frames.extensions.views.tint
+import dev.jahir.frames.extensions.views.visible
 import dev.jahir.frames.extensions.views.visibleIf
 import dev.jahir.frames.ui.activities.base.BaseWallpaperApplierActivity
-import dev.jahir.frames.ui.fragments.WallpapersFragment
+import dev.jahir.frames.ui.fragments.WallpapersFragment.Companion.WALLPAPER_EXTRA
 import dev.jahir.frames.ui.fragments.viewer.DetailsFragment
 import dev.jahir.frames.ui.fragments.viewer.SetAsOptionsDialog
+import kotlinx.coroutines.launch
 
 open class ViewerActivity : BaseWallpaperApplierActivity<Preferences>() {
 
@@ -72,13 +80,17 @@ open class ViewerActivity : BaseWallpaperApplierActivity<Preferences>() {
     private var firstImageLoad: Boolean = true
     private var transitioned: Boolean = false
     private var closing: Boolean = false
-    private var currentWallPosition: Int = 0
     private var favoritesModified: Boolean = false
     private var isInFavorites: Boolean = false
         set(value) {
             field = value
-            bottomNavigation?.setSelectedItemId(if (value) R.id.favorites else R.id.details, false)
+            bottomNavigation?.setSelectedItemId(
+                if (value) R.id.favorites else R.id.details,
+                false
+            )
         }
+    private var collectionName: String? = null
+    private var isForFavs: Boolean = false
 
     private val detailsFragment: DetailsFragment by lazy {
         DetailsFragment.create(shouldShowPaletteDetails = shouldShowWallpapersPalette())
@@ -106,34 +118,12 @@ open class ViewerActivity : BaseWallpaperApplierActivity<Preferences>() {
         super.onCreate(savedInstanceState)
         statusBarLight = false
         navigationBarLight = false
-        window.setFlags(WindowManager.LayoutParams.FLAG_SECURE,
-            WindowManager.LayoutParams.FLAG_SECURE);
+        window.setFlags(
+            WindowManager.LayoutParams.FLAG_SECURE,
+            WindowManager.LayoutParams.FLAG_SECURE
+        );
         setContentView(R.layout.activity_viewer)
         bottomNavigation?.labelVisibilityMode = NavigationBarView.LABEL_VISIBILITY_LABELED
-
-        currentWallPosition = intent?.extras?.getInt(CURRENT_WALL_POSITION, 0) ?: 0
-
-        val wallpaper =
-            intent?.extras?.getParcelable<Wallpaper?>(WallpapersFragment.WALLPAPER_EXTRA)
-
-        if (wallpaper == null) {
-            finish()
-            return
-        }
-
-        if (wallpaper.downloadable == false || !shouldShowDownloadOption())
-            bottomNavigation?.removeItem(R.id.download)
-
-        findViewById<View?>(R.id.toolbar_title)?.let {
-            (it as? TextView)?.text = wallpaper.name
-        }
-        findViewById<View?>(R.id.toolbar_subtitle)?.let {
-            (it as? TextView)?.text = wallpaper.author
-            it.visibleIf(wallpaper.author.hasContent())
-        }
-
-        initWallpaperFetcher(wallpaper)
-        detailsFragment.wallpaper = wallpaper
 
         setSupportActionBar(toolbar)
         supportActionBar?.let {
@@ -150,30 +140,82 @@ open class ViewerActivity : BaseWallpaperApplierActivity<Preferences>() {
                 return super.onSingleTapConfirmed(e)
             }
         })
-        loadWallpaper(wallpaper)
-
-        isInFavorites =
-            intent?.extras?.getBoolean(WallpapersFragment.WALLPAPER_IN_FAVS_EXTRA, false)
-                ?: wallpaper.isInFavorites
 
         wallpapersViewModel.observeFavorites(this) {
-            this.isInFavorites = it.any { wall -> wall.url == wallpaper.url }
+            this.isInFavorites = it.any { wall -> wall.url == wallpaperDownloadUrl }
         }
 
-        bottomNavigation?.setSelectedItemId(
-            if (isInFavorites) R.id.favorites else R.id.details,
-            false
+        // WALLPAPER SPECIFIC RELATED SETUP ↓
+        collectionName = intent?.extras?.getString(CollectionActivity.COLLECTION_NAME_KEY)
+        isForFavs = intent?.extras?.getBoolean(IS_FOR_FAVS, false) ?: false
+
+        val lastWallpaper = savedInstanceState?.getString(WALLPAPER_URL_KEY)
+        val wallpaperFromIntent = intent?.extras?.getParcelable<Wallpaper?>(WALLPAPER_EXTRA)?.url
+
+        lifecycleScope.launch {
+            configureUIForWallpaper(
+                wallpapersViewModel.findWallpaper(
+                    lastWallpaper ?: wallpaperFromIntent
+                )
+            )
+        }
+    }
+
+    private fun configureUIForWallpaper(wallpaper: Wallpaper?) {
+        if (wallpaper == null) {
+            finish()
+            return
+        }
+
+        bottomNavigation?.setItemVisible(
+            R.id.download,
+            !(wallpaper.downloadable == false || !shouldShowDownloadOption())
         )
+
+        findViewById<View?>(R.id.toolbar_title)?.let {
+            (it as? TextView)?.text = wallpaper.name
+        }
+        findViewById<View?>(R.id.toolbar_subtitle)?.let {
+            (it as? TextView)?.text = wallpaper.author
+            it.visibleIf(wallpaper.author.hasContent())
+        }
+
+        initWallpaperFetcher(wallpaper)
+        detailsFragment.wallpaper = wallpaper
+        loadWallpaper(wallpaper)
+
+        isInFavorites = wallpaper.isInFavorites
         loadWallpapersData()
 
         bottomNavigation?.setOnNavigationItemSelectedListener {
             handleNavigationItemSelected(it.itemId, wallpaper)
         }
+
+        findViewById<AppCompatImageButton>(R.id.go_previous)?.setOnClickListener {
+            lifecycleScope.launch {
+                val previousWallpaper = if (isForFavs) {
+                    wallpapersViewModel.getPreviousFavoriteWallpaper(wallpaper.url)
+                } else {
+                    wallpapersViewModel.getPreviousWallpaper(wallpaper.url, collectionName)
+                }
+                configureUIForWallpaper(previousWallpaper)
+            }
+        }
+
+        findViewById<AppCompatImageButton>(R.id.go_next)?.setOnClickListener {
+            lifecycleScope.launch {
+                val nextWallpaper = if (isForFavs) {
+                    wallpapersViewModel.getNextFavoriteWallpaper(wallpaper.url)
+                } else {
+                    wallpapersViewModel.getNextWallpaper(wallpaper.url, collectionName)
+                }
+                configureUIForWallpaper(nextWallpaper)
+            }
+        }
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
-        outState.putInt(CURRENT_WALL_POSITION, currentWallPosition)
         outState.putBoolean(CLOSING_KEY, closing)
         outState.putBoolean(TRANSITIONED_KEY, transitioned)
         outState.putBoolean(IS_IN_FAVORITES_KEY, isInFavorites)
@@ -182,7 +224,6 @@ open class ViewerActivity : BaseWallpaperApplierActivity<Preferences>() {
 
     override fun onRestoreInstanceState(savedInstanceState: Bundle) {
         super.onRestoreInstanceState(savedInstanceState)
-        this.currentWallPosition = savedInstanceState.getInt(CURRENT_WALL_POSITION, 0)
         this.closing = savedInstanceState.getBoolean(CLOSING_KEY, false)
         this.transitioned = savedInstanceState.getBoolean(TRANSITIONED_KEY, false)
         this.isInFavorites = savedInstanceState.getBoolean(IS_IN_FAVORITES_KEY, false)
@@ -246,33 +287,42 @@ open class ViewerActivity : BaseWallpaperApplierActivity<Preferences>() {
         }
     }
 
-    private fun setBackgroundColor(@ColorInt color: Int = 0) {
-        findViewById<View?>(R.id.activity_root_view)?.setBackgroundColor(color)
+    private fun setBackgroundColor(@ColorInt color: Int? = null) {
+        findViewById<View?>(R.id.activity_root_view)?.setBackgroundColor(
+            color ?: resolveColor(android.R.attr.colorBackground)
+        )
     }
 
-    private fun loadWallpaper(wallpaper: Wallpaper?) {
+    private fun loadWallpaper(wallpaper: Wallpaper) {
+        findViewById<View?>(R.id.loading)?.visible()
         var placeholder: Drawable? = null
+        val wallpaperFromIntent = intent?.extras?.getParcelable<Wallpaper?>(WALLPAPER_EXTRA)?.url
         try {
-            openFileInput(SHARED_IMAGE_NAME)?.use {
-                placeholder = BitmapDrawable(resources, it)
-            }
-        } catch (e: Exception) {
-        }
-        wallpaper?.let {
-            imageView?.loadFramesPic(
-                wallpaper.url,
-                wallpaper.thumbnail,
-                placeholder,
-                forceLoadFullRes = true,
-                cropAsCircle = false,
-                saturate = false
-            ) {
-                if (firstImageLoad) {
-                    firstImageLoad = false
-                    imageView?.resetZoomAnimated()
+            if (wallpaperFromIntent == wallpaper.url) {
+                openFileInput(SHARED_IMAGE_NAME)?.use {
+                    placeholder = BitmapDrawable(resources, it)
                 }
-                generatePalette(it)
+            } else {
+                imageView?.dispose()
+                placeholder = Color.TRANSPARENT.toDrawable()
+                firstImageLoad = true
+                setBackgroundColor()
             }
+        } catch (_: Exception) {
+        }
+        imageView?.loadFramesPic(
+            wallpaper.url,
+            wallpaper.thumbnail,
+            placeholder,
+            forceLoadFullRes = true,
+            cropAsCircle = false,
+            saturate = false
+        ) { w ->
+            if (firstImageLoad) {
+                firstImageLoad = false
+                imageView?.resetZoomAnimated()
+            }
+            generatePalette(w)
         }
     }
 
@@ -404,11 +454,11 @@ open class ViewerActivity : BaseWallpaperApplierActivity<Preferences>() {
         internal const val FAVORITES_MODIFIED = "favorites_modified"
         internal const val FAVORITES_MODIFIED_RESULT = 1
         internal const val FAVORITES_NOT_MODIFIED_RESULT = 0
-        internal const val CURRENT_WALL_POSITION = "curr_wall_pos"
         internal const val LICENSE_CHECK_ENABLED = "license_check_enabled"
         internal const val CAN_TOGGLE_SYSTEMUI_VISIBILITY_KEY = "can_toggle_visibility"
         internal const val SHARED_IMAGE_NAME = "thumb.jpg"
         internal const val TRANSITION_NAME = "wallpaper_transition_container"
+        internal const val IS_FOR_FAVS = "viewer_is_for_favs"
         private const val ENTER_TRANSITION_DURATION = 300L
         private const val RETURN_TRANSITION_DURATION = 250L
         private const val CLOSING_KEY = "closing"
