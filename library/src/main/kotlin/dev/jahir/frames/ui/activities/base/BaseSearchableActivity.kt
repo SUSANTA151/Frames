@@ -1,8 +1,10 @@
 package dev.jahir.frames.ui.activities.base
 
+import android.content.Intent
 import android.os.Bundle
 import android.view.Menu
 import android.view.MenuItem
+import android.view.View
 import androidx.annotation.MenuRes
 import androidx.appcompat.widget.Toolbar
 import dev.jahir.frames.R
@@ -13,6 +15,9 @@ import dev.jahir.frames.extensions.views.gone
 import dev.jahir.frames.extensions.views.goneIf
 import dev.jahir.frames.extensions.views.tint
 import dev.jahir.frames.extensions.views.visible
+import dev.jahir.frames.ui.activities.ViewerActivity
+import dev.jahir.frames.ui.animations.WallpaperReturnSharedElementCallback
+import dev.jahir.frames.ui.fragments.WallpapersFragment
 import dev.jahir.frames.ui.widgets.CleanSearchView
 
 @Suppress("LeakingThis")
@@ -29,6 +34,38 @@ abstract class BaseSearchableActivity<out P : Preferences> : BaseFavoritesConnec
 
     private val searchOpen: Boolean
         get() = searchView?.isOpen ?: false
+
+    private val wallpaperReturnCallback = WallpaperReturnSharedElementCallback()
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setExitSharedElementCallback(wallpaperReturnCallback)
+    }
+
+    // Runs before the return transition, so it can point it at the wallpaper the viewer ended on
+    override fun onActivityReenter(resultCode: Int, data: Intent?) {
+        super.onActivityReenter(resultCode, data)
+        val url = data?.getStringExtra(ViewerActivity.CURRENT_WALLPAPER_URL_EXTRA) ?: return
+        val fragment = supportFragmentManager.fragments
+            .filterIsInstance<WallpapersFragment>()
+            .firstOrNull { it.isVisible } ?: return
+        var started = false
+        val startReturnTransition = { card: View? ->
+            if (!started) {
+                started = true
+                wallpaperReturnCallback.setReturnTarget(card)
+                supportStartPostponedEnterTransition()
+            }
+        }
+        supportPostponeEnterTransition()
+        val isInFavorites = data.extras?.takeIf {
+            it.containsKey(ViewerActivity.CURRENT_WALLPAPER_IN_FAVORITES_EXTRA)
+        }?.getBoolean(ViewerActivity.CURRENT_WALLPAPER_IN_FAVORITES_EXTRA)
+        fragment.findWallpaperCard(url, isInFavorites) { card -> startReturnTransition(card) }
+        // The screen stays frozen while the transition is postponed, so never wait for the card
+        // longer than this. Without a card it fades back instead of flying to the wrong one.
+        postDelayed(RETURN_TRANSITION_TIMEOUT) { startReturnTransition(null) }
+    }
 
     override fun onCreateOptionsMenu(menu: Menu): Boolean {
         menuInflater.inflate(getMenuRes(), menu)
@@ -91,5 +128,6 @@ abstract class BaseSearchableActivity<out P : Preferences> : BaseFavoritesConnec
 
     companion object {
         private const val CURRENT_ITEM_KEY = "current_item"
+        private const val RETURN_TRANSITION_TIMEOUT = 300L
     }
 }

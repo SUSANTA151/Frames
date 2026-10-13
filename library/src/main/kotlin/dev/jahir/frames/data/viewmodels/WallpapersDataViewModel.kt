@@ -5,15 +5,12 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.viewModelScope
-import com.google.gson.Gson
-import com.google.gson.GsonBuilder
-import com.google.gson.reflect.TypeToken
-import com.google.gson.stream.MalformedJsonException
 import dev.jahir.frames.data.db.FramesDatabase
 import dev.jahir.frames.data.models.Collection
 import dev.jahir.frames.data.models.Favorite
 import dev.jahir.frames.data.models.Wallpaper
-import dev.jahir.frames.data.network.WallpapersJSONService
+import dev.jahir.frames.data.network.framesHttpClient
+import dev.jahir.frames.data.network.parseWallpapersJson
 import dev.jahir.frames.extensions.context.isNetworkAvailable
 import dev.jahir.frames.extensions.resources.hasContent
 import dev.jahir.frames.extensions.utils.context
@@ -24,10 +21,9 @@ import kotlinx.coroutines.Dispatchers.IO
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import retrofit2.Retrofit
-import retrofit2.converter.gson.GsonConverterFactory
-import retrofit2.converter.scalars.ScalarsConverterFactory
-import java.lang.reflect.Type
+import okhttp3.Request
+import org.json.JSONException
+import java.io.IOException
 
 internal typealias CollectionWithWallpapers = Pair<String, List<Wallpaper>>
 
@@ -48,14 +44,6 @@ open class WallpapersDataViewModel(application: Application) : AndroidViewModel(
 
     internal var whenReady: (() -> Unit)? = null
     internal var errorListener: ((error: DataError) -> Unit)? = null
-
-    private val service by lazy {
-        Retrofit.Builder()
-            .baseUrl("http://localhost/")
-            .addConverterFactory(ScalarsConverterFactory.create())
-            .addConverterFactory(GsonConverterFactory.create(GsonBuilder().create()))
-            .build().create(WallpapersJSONService::class.java)
-    }
 
     open fun internalTransformWallpapersToCollections(wallpapers: List<Wallpaper>): List<Collection> {
         val collectionsMap: MutableMap<String, CollectionWithWallpapers> = hashMapOf()
@@ -107,21 +95,15 @@ open class WallpapersDataViewModel(application: Application) : AndroidViewModel(
         }
     }
 
-    private suspend fun deleteAllWallpapers() = withContext(IO) {
-        try {
-            FramesDatabase.getAppDatabase(context)?.wallpapersDao()
-                ?.nuke()
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-    }
-
     private suspend fun saveWallpapers(wallpapers: List<Wallpaper>) = withContext(IO) {
         try {
-            deleteAllWallpapers()
-            delay(10)
-            FramesDatabase.getAppDatabase(context)?.wallpapersDao()
-                ?.insertAll(wallpapers)
+            val database = FramesDatabase.getAppDatabase(context) ?: return@withContext
+            val wallpapersDao = database.wallpapersDao() ?: return@withContext
+            // One transaction, so readers never see the table empty between both calls
+            database.runInTransaction {
+                wallpapersDao.nuke()
+                wallpapersDao.insertAll(wallpapers)
+            }
         } catch (e: Exception) {
             e.printStackTrace()
         }
@@ -238,8 +220,16 @@ open class WallpapersDataViewModel(application: Application) : AndroidViewModel(
             if (!areTheSameFavorites || favorites.isEmpty() || force)
                 postFavorites(actualFavorites)
         }
-        saveWallpapers(actualNewWallpapers)
+        if (!areTheSameWallpapers) saveWallpapers(actualNewWallpapers)
         postDelayed(10) { whenReady?.invoke() }
+    }
+
+    // An HTTP error throws instead of returning the error page as JSON
+    private suspend fun fetchJson(url: String): String = withContext(IO) {
+        framesHttpClient.newCall(Request.Builder().url(url).build()).execute().use { response ->
+            if (!response.isSuccessful) throw IOException("HTTP ${response.code} for $url")
+            response.body?.string().orEmpty()
+        }
     }
 
     private suspend fun loadRemoteData(
@@ -257,19 +247,17 @@ open class WallpapersDataViewModel(application: Application) : AndroidViewModel(
             return
         }
         try {
-            val remoteWallpapers: List<Wallpaper>
-            if (isLocalFile) {
-                val jsonString = context.assets?.open(url.replace("file:///android_asset/", ""))
+            val json = if (isLocalFile) {
+                context.assets?.open(url.replace("file:///android_asset/", ""))
                     ?.bufferedReader()
-                    ?.readText()
-                val listType: Type = object : TypeToken<List<Wallpaper?>?>() {}.type
-                remoteWallpapers = Gson().fromJson(jsonString, listType)
+                    ?.use { it.readText() }
             } else {
-                remoteWallpapers = service.getJSON(url)
+                fetchJson(url)
             }
+            val remoteWallpapers = parseWallpapersJson(json.orEmpty())
             handleWallpapersData(loadCollections, loadFavorites, remoteWallpapers, force)
         } catch (e: Exception) {
-            if (triggerErrorListener && e is MalformedJsonException)
+            if (triggerErrorListener && e is JSONException)
                 errorListener?.invoke(DataError.MalformedJson)
         }
     }
@@ -342,66 +330,6 @@ open class WallpapersDataViewModel(application: Application) : AndroidViewModel(
         favoritesData.removeObservers(owner)
     }
 
-    private suspend fun getNextWallpaperInCollection(
-        currentUrl: String,
-        collection: String
-    ): Wallpaper? = withContext(IO) {
-        val wallpapersDao = FramesDatabase.getAppDatabase(context)?.wallpapersDao()
-        wallpapersDao?.getNextWallpaperInCollection(currentUrl, collection)
-            ?: wallpapersDao?.getFirstWallpaperInCollection(collection) // Wrap to beginning
-    }
-
-    private suspend fun getPreviousWallpaperInCollection(
-        currentUrl: String,
-        collection: String
-    ): Wallpaper? = withContext(IO) {
-        val wallpapersDao = FramesDatabase.getAppDatabase(context)?.wallpapersDao()
-        wallpapersDao?.getPreviousWallpaperInCollection(currentUrl, collection)
-            ?: wallpapersDao?.getLastWallpaperInCollection(collection) // Wrap to end
-    }
-
-    // Get next wallpaper (any collection or specific collection)
-    suspend fun getNextWallpaper(currentUrl: String, collection: String? = null): Wallpaper? =
-        withContext(IO) {
-            val wallpapersDao = FramesDatabase.getAppDatabase(context)?.wallpapersDao()
-            if (collection != null) {
-                getNextWallpaperInCollection(currentUrl, collection)
-            } else {
-                wallpapersDao?.getNextWallpaper(currentUrl) ?: wallpapersDao?.getFirstWallpaper()
-            }
-        }
-
-    suspend fun getPreviousWallpaper(currentUrl: String, collection: String? = null): Wallpaper? =
-        withContext(IO) {
-            val wallpapersDao = FramesDatabase.getAppDatabase(context)?.wallpapersDao()
-            if (collection != null) {
-                getPreviousWallpaperInCollection(currentUrl, collection)
-            } else {
-                wallpapersDao?.getPreviousWallpaper(currentUrl) ?: wallpapersDao?.getLastWallpaper()
-            }
-        }
-
-    // Get next wallpaper (any collection or specific collection)
-    suspend fun getNextFavoriteWallpaper(currentUrl: String): Wallpaper? = withContext(IO) {
-        val db = FramesDatabase.getAppDatabase(context)
-        val favoritesDao = db?.favoritesDao()
-        val wallpaperUrl = favoritesDao?.getNextFavorite(currentUrl)?.url
-            ?: favoritesDao?.getFirstFavorite()?.url
-        wallpaperUrl?.let { url ->
-            db?.wallpapersDao()?.getWallpaperByUrl(url)
-        }
-    }
-
-    suspend fun getPreviousFavoriteWallpaper(currentUrl: String): Wallpaper? = withContext(IO) {
-        val db = FramesDatabase.getAppDatabase(context)
-        val favoritesDao = db?.favoritesDao()
-        val wallpaperUrl = favoritesDao?.getPreviousFavorite(currentUrl)?.url
-            ?: favoritesDao?.getLastFavorite()?.url
-        wallpaperUrl?.let { url ->
-            db?.wallpapersDao()?.getWallpaperByUrl(url)
-        }
-    }
-
     suspend fun findWallpaper(url: String?): Wallpaper? =
         withContext(IO) {
             if (url == null) return@withContext null
@@ -409,22 +337,8 @@ open class WallpapersDataViewModel(application: Application) : AndroidViewModel(
                 ?.getWallpaperByUrl(url)
         }
 
-    private fun <T> areTheSameLists(local: List<T>, remote: List<T>): Boolean {
-        try {
-            var areTheSame = true
-            for ((index, wallpaper) in remote.withIndex()) {
-                if (local.indexOf(wallpaper) != index) {
-                    areTheSame = false
-                    break
-                }
-            }
-            if (!areTheSame) return false
-            val difference = ArrayList<T>(remote).apply { removeAll(local.toSet()) }.size
-            return difference <= 0 && remote.size == local.size
-        } catch (e: Exception) {
-            return false
-        }
-    }
+    // Same elements in the same order. Linear, unlike an indexOf per element
+    private fun <T> areTheSameLists(local: List<T>, remote: List<T>): Boolean = local == remote
 
     enum class DataError {
         None, MalformedJson, NoNetwork, Unknown

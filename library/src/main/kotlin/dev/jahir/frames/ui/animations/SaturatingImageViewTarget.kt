@@ -21,11 +21,14 @@ import android.graphics.drawable.Drawable
 import android.widget.ImageView
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
-import coil.decode.DataSource
-import coil.request.ImageRequest
-import coil.request.SuccessResult
-import coil.target.Target
-import coil.target.ViewTarget
+import coil3.Image
+import coil3.asDrawable
+import coil3.decode.DataSource
+import coil3.request.ErrorResult
+import coil3.request.ImageRequest
+import coil3.request.SuccessResult
+import coil3.target.Target
+import coil3.target.ViewTarget
 import com.ortiz.touchview.TouchImageView
 import dev.jahir.frames.extensions.context.preferences
 
@@ -38,11 +41,12 @@ open class SaturatingImageViewTarget(
 ) : ViewTarget<ImageView>, DefaultLifecycleObserver, ImageRequest.Listener {
 
     private val afterSuccessListeners: ArrayList<((drawable: Drawable?) -> Unit)> = ArrayList()
+    private val afterErrorListeners: ArrayList<() -> Unit> = ArrayList()
     private var isStarted = false
 
-    override fun onStart(placeholder: Drawable?) = setDrawable(placeholder)
+    override fun onStart(placeholder: Image?) = setDrawable(placeholder?.asDrawable(view.resources))
 
-    override fun onSuccess(result: Drawable) = setDrawable(result)
+    override fun onSuccess(result: Image) = setDrawable(result.asDrawable(view.resources))
 
     override fun onSuccess(request: ImageRequest, result: SuccessResult) {
         super<ImageRequest.Listener>.onSuccess(request, result)
@@ -58,7 +62,13 @@ open class SaturatingImageViewTarget(
         afterSuccessListeners.clear()
     }
 
-    override fun onError(error: Drawable?) = setDrawable(error)
+    override fun onError(error: Image?) = setDrawable(error?.asDrawable(view.resources))
+
+    override fun onError(request: ImageRequest, result: ErrorResult) {
+        super<ImageRequest.Listener>.onError(request, result)
+        afterErrorListeners.forEach { it.invoke() }
+        afterErrorListeners.clear()
+    }
 
     override fun onDestroy(owner: LifecycleOwner) {
         super.onDestroy(owner)
@@ -89,4 +99,7 @@ open class SaturatingImageViewTarget(
 
     fun addListener(listener: (drawable: Drawable?) -> Unit): SaturatingImageViewTarget =
         this.apply { this.afterSuccessListeners.add(listener) }
+
+    fun addErrorListener(listener: () -> Unit): SaturatingImageViewTarget =
+        this.apply { this.afterErrorListeners.add(listener) }
 }

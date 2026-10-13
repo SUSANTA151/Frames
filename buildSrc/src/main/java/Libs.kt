@@ -1,9 +1,6 @@
 @file:Suppress("unused")
 
 object Libs {
-    // Kotlin
-    private const val kotlin = "org.jetbrains.kotlin:kotlin-stdlib-jdk7:${Versions.kotlin}"
-
     // Coroutines
     private const val coroutines =
         "org.jetbrains.kotlinx:kotlinx-coroutines-core:${Versions.coroutines}"
@@ -14,7 +11,6 @@ object Libs {
     private const val appcompat = "androidx.appcompat:appcompat:${Versions.appcompat}"
     private const val appcompatResources =
         "androidx.appcompat:appcompat-resources:${Versions.appcompat}"
-    private const val cardView = "androidx.cardview:cardview:${Versions.cardView}"
     private const val recyclerView = "androidx.recyclerview:recyclerview:${Versions.recyclerView}"
     private const val swipeRefreshLayout =
         "androidx.swiperefreshlayout:swiperefreshlayout:${Versions.swipeRefreshLayout}"
@@ -26,7 +22,6 @@ object Libs {
     private const val fragmentKtx = "androidx.fragment:fragment-ktx:${Versions.fragmentKtx}"
 
     // ViewModel and LiveData
-    private const val lifecycle = "androidx.lifecycle:lifecycle-extensions:${Versions.lifecycleExt}"
     private const val livedataKtx =
         "androidx.lifecycle:lifecycle-livedata-ktx:${Versions.lifecycle}"
     private const val viewmodelKtx =
@@ -40,21 +35,19 @@ object Libs {
     private const val work = "androidx.work:work-runtime-ktx:${Versions.work}"
 
     // Network & Serialization
-    private const val gson = "com.google.code.gson:gson:${Versions.gson}"
-    private const val retrofit = "com.squareup.retrofit2:retrofit:${Versions.retrofit}"
-    private const val retrofitGsonConverter =
-        "com.squareup.retrofit2:converter-gson:${Versions.retrofit}"
-    private const val retrofitScalarsConverter =
-        "com.squareup.retrofit2:converter-scalars:${Versions.retrofit}"
+    // Same version coil-network-okhttp depends on
+    private const val okhttp = "com.squareup.okhttp3:okhttp:${Versions.okhttp}"
 
     // Image loading and Touch Image View
-    private const val coil = "io.coil-kt:coil:${Versions.coil}"
+    private const val coil = "io.coil-kt.coil3:coil:${Versions.coil}"
+    // Coil 3 only loads from the network with a network artifact
+    private const val coilNetwork = "io.coil-kt.coil3:coil-network-okhttp:${Versions.coil}"
     private const val touchImageView =
         "com.github.MikeOrtiz:TouchImageView:${Versions.touchImageView}"
 
     // Harmonic colors
     private const val harmonicColors =
-        "com.github.LeonardoSM04:HarmonicColorExtractor:${Versions.harmonicColors}"
+        "dev.jahir:harmonic-colors:${Versions.harmonicColors}"
 
     // Sectioned RecyclerView
     private const val sectionedRecyclerView =
@@ -75,9 +68,6 @@ object Libs {
     private const val inAppBilling =
         "com.android.billingclient:billing-ktx:${Versions.inAppBilling}"
 
-    // MultiDex
-    private const val multidex = "androidx.multidex:multidex:${Versions.multidex}"
-
     // OneSignal
     const val oneSignal = "com.onesignal:OneSignal:${Versions.oneSignal}"
 
@@ -86,12 +76,10 @@ object Libs {
 
     // Dependencies (must use api for they to work)
     val dependencies = arrayOf(
-        kotlin,
         coroutines,
         coroutinesAndroid,
         appcompat,
         appcompatResources,
-        cardView,
         recyclerView,
         swipeRefreshLayout,
         palette,
@@ -99,16 +87,13 @@ object Libs {
         materialComponents,
         activityKtx,
         fragmentKtx,
-        lifecycle,
         livedataKtx,
         viewmodelKtx,
         room,
         work,
-        gson,
-        retrofit,
-        retrofitGsonConverter,
-        retrofitScalarsConverter,
+        okhttp,
         coil,
+        coilNetwork,
         touchImageView,
         harmonicColors,
         sectionedRecyclerView,
@@ -116,7 +101,6 @@ object Libs {
         permissions,
         licenseChecker,
         inAppBilling,
-        multidex,
         muzei
     )
 

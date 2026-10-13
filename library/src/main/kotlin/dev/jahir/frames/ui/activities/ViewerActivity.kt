@@ -3,9 +3,9 @@
 package dev.jahir.frames.ui.activities
 
 import android.Manifest
+import android.app.ActivityManager
 import android.content.Intent
 import android.graphics.Color
-import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
 import android.os.Bundle
 import android.view.GestureDetector
@@ -27,7 +27,15 @@ import androidx.core.view.ViewCompat
 import androidx.fragment.app.DialogFragment
 import androidx.lifecycle.lifecycleScope
 import androidx.palette.graphics.Palette
-import coil.dispose
+import coil3.asDrawable
+import coil3.dispose
+import coil3.executeBlocking
+import coil3.imageLoader
+import coil3.memory.MemoryCache
+import coil3.request.CachePolicy
+import coil3.request.ImageRequest
+import coil3.request.SuccessResult
+import coil3.size.Scale
 import com.google.android.material.navigation.NavigationBarView
 import com.google.android.material.transition.platform.MaterialContainerTransform
 import com.google.android.material.transition.platform.MaterialContainerTransformSharedElementCallback
@@ -41,6 +49,7 @@ import dev.jahir.frames.extensions.context.compliesWithMinTime
 import dev.jahir.frames.extensions.context.findView
 import dev.jahir.frames.extensions.context.firstInstallTime
 import dev.jahir.frames.extensions.context.isNetworkAvailable
+import dev.jahir.frames.extensions.context.isActiveNetworkMetered
 import dev.jahir.frames.extensions.context.isWifiConnected
 import dev.jahir.frames.extensions.context.navigationBarLight
 import dev.jahir.frames.extensions.context.resolveColor
@@ -62,6 +71,7 @@ import dev.jahir.frames.extensions.views.setPaddingLeft
 import dev.jahir.frames.extensions.views.setPaddingRight
 import dev.jahir.frames.extensions.views.setPaddingTop
 import dev.jahir.frames.extensions.views.tint
+import dev.jahir.frames.extensions.utils.filteredBy
 import dev.jahir.frames.extensions.views.visible
 import dev.jahir.frames.extensions.views.visibleIf
 import dev.jahir.frames.ui.activities.base.BaseWallpaperApplierActivity
@@ -88,9 +98,14 @@ open class ViewerActivity : BaseWallpaperApplierActivity<Preferences>() {
                 if (value) R.id.favorites else R.id.details,
                 false
             )
+            setViewerResult()
         }
     private var collectionName: String? = null
     private var isForFavs: Boolean = false
+    private var currentWallpaper: Wallpaper? = null
+    private var preloadedNeighborsOf: String? = null
+    private var searchQuery: String? = null
+    private var navigableWallpapers: List<Wallpaper> = emptyList()
 
     private val detailsFragment: DetailsFragment by lazy {
         DetailsFragment.create(shouldShowPaletteDetails = shouldShowWallpapersPalette())
@@ -124,6 +139,10 @@ open class ViewerActivity : BaseWallpaperApplierActivity<Preferences>() {
         );
         setContentView(R.layout.activity_viewer)
         bottomNavigation?.labelVisibilityMode = NavigationBarView.LABEL_VISIBILITY_LABELED
+        // Set before the first frame, so the bar does not change once the wallpaper loads
+        (savedInstanceState?.getParcelable<Wallpaper?>(CURRENT_WALLPAPER_KEY)
+            ?: intent?.extras?.getParcelable<Wallpaper?>(WALLPAPER_EXTRA))
+            ?.let { updateDownloadVisibility(it) }
 
         setSupportActionBar(toolbar)
         supportActionBar?.let {
@@ -141,17 +160,38 @@ open class ViewerActivity : BaseWallpaperApplierActivity<Preferences>() {
             }
         })
 
-        wallpapersViewModel.observeFavorites(this) {
-            this.isInFavorites = it.any { wall -> wall.url == wallpaperDownloadUrl }
-        }
-
         // WALLPAPER SPECIFIC RELATED SETUP ↓
         collectionName = intent?.extras?.getString(CollectionActivity.COLLECTION_NAME_KEY)
         isForFavs = intent?.extras?.getBoolean(IS_FOR_FAVS, false) ?: false
+        searchQuery = intent?.extras?.getString(SEARCH_QUERY)
+
+        wallpapersViewModel.observeFavorites(this) {
+            this.isInFavorites = it.any { wall -> wall.url == wallpaperDownloadUrl }
+            // Set once, so a wallpaper removed from favorites here stays navigable until the
+            // viewer closes. The favorites list updates when the user goes back to it
+            if (isForFavs && navigableWallpapers.isEmpty()) updateNavigableWallpapers(it)
+        }
+        when {
+            isForFavs -> {}
+            collectionName != null -> wallpapersViewModel.observeCollections(this) { collections ->
+                updateNavigableWallpapers(
+                    collections.firstOrNull { it.name == collectionName }?.wallpapers.orEmpty()
+                )
+            }
+            else -> wallpapersViewModel.observeWallpapers(this) { updateNavigableWallpapers(it) }
+        }
+
+        findViewById<AppCompatImageButton>(R.id.go_previous)?.setOnClickListener {
+            configureUIForWallpaper(getAdjacentWallpaper(next = false))
+        }
+        findViewById<AppCompatImageButton>(R.id.go_next)?.setOnClickListener {
+            configureUIForWallpaper(getAdjacentWallpaper(next = true))
+        }
 
         val lastWallpaper = savedInstanceState?.getString(WALLPAPER_URL_KEY)
         val wallpaperFromIntent = intent?.extras?.getParcelable<Wallpaper?>(WALLPAPER_EXTRA)?.url
 
+        loadWallpapersData()
         lifecycleScope.launch {
             configureUIForWallpaper(
                 wallpapersViewModel.findWallpaper(
@@ -161,16 +201,49 @@ open class ViewerActivity : BaseWallpaperApplierActivity<Preferences>() {
         }
     }
 
+    /**
+     * Mirrors the list the viewer was opened from: same source, same search filter, same order
+     */
+    private fun updateNavigableWallpapers(source: List<Wallpaper>) {
+        navigableWallpapers = source.filteredBy(searchQuery)
+        updateNavigationArrows()
+        // The list can arrive after the current image loaded
+        if (!firstImageLoad) preloadAdjacentWallpapers()
+    }
+
+    private fun currentIndex(): Int =
+        navigableWallpapers.indexOfFirst { it.url == wallpaperDownloadUrl }
+
+    private fun updateNavigationArrows() {
+        val canNavigate = navigableWallpapers.size > 1 && currentIndex() >= 0
+        findViewById<AppCompatImageButton>(R.id.go_previous)?.visibleIf(canNavigate)
+        findViewById<AppCompatImageButton>(R.id.go_next)?.visibleIf(canNavigate)
+    }
+
+    private fun getAdjacentWallpaper(next: Boolean): Wallpaper? {
+        val index = currentIndex()
+        if (index < 0) return null
+        val size = navigableWallpapers.size
+        return navigableWallpapers[(index + (if (next) 1 else -1) + size) % size]
+    }
+
+    private fun updateDownloadVisibility(wallpaper: Wallpaper) {
+        bottomNavigation?.setItemVisible(
+            R.id.download,
+            wallpaper.downloadable != false && shouldShowDownloadOption()
+        )
+    }
+
     private fun configureUIForWallpaper(wallpaper: Wallpaper?) {
         if (wallpaper == null) {
             finish()
             return
         }
 
-        bottomNavigation?.setItemVisible(
-            R.id.download,
-            !(wallpaper.downloadable == false || !shouldShowDownloadOption())
-        )
+        currentWallpaper = wallpaper
+        // Set now, not only in finish(): the return transition reads the result when it starts
+        setViewerResult()
+        updateDownloadVisibility(wallpaper)
 
         findViewById<View?>(R.id.toolbar_title)?.let {
             (it as? TextView)?.text = wallpaper.name
@@ -184,34 +257,14 @@ open class ViewerActivity : BaseWallpaperApplierActivity<Preferences>() {
         detailsFragment.wallpaper = wallpaper
         loadWallpaper(wallpaper)
 
-        isInFavorites = wallpaper.isInFavorites
-        loadWallpapersData()
+        // Wallpapers read from the database never have isInFavorites set
+        isInFavorites = wallpapersViewModel.favorites.any { it.url == wallpaper.url }
 
         bottomNavigation?.setOnNavigationItemSelectedListener {
             handleNavigationItemSelected(it.itemId, wallpaper)
         }
 
-        findViewById<AppCompatImageButton>(R.id.go_previous)?.setOnClickListener {
-            lifecycleScope.launch {
-                val previousWallpaper = if (isForFavs) {
-                    wallpapersViewModel.getPreviousFavoriteWallpaper(wallpaper.url)
-                } else {
-                    wallpapersViewModel.getPreviousWallpaper(wallpaper.url, collectionName)
-                }
-                configureUIForWallpaper(previousWallpaper)
-            }
-        }
-
-        findViewById<AppCompatImageButton>(R.id.go_next)?.setOnClickListener {
-            lifecycleScope.launch {
-                val nextWallpaper = if (isForFavs) {
-                    wallpapersViewModel.getNextFavoriteWallpaper(wallpaper.url)
-                } else {
-                    wallpapersViewModel.getNextWallpaper(wallpaper.url, collectionName)
-                }
-                configureUIForWallpaper(nextWallpaper)
-            }
-        }
+        updateNavigationArrows()
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
@@ -220,6 +273,7 @@ open class ViewerActivity : BaseWallpaperApplierActivity<Preferences>() {
         outState.putBoolean(TRANSITIONED_KEY, transitioned)
         outState.putBoolean(IS_IN_FAVORITES_KEY, isInFavorites)
         outState.putBoolean(FAVORITES_MODIFIED, favoritesModified)
+        outState.putParcelable(CURRENT_WALLPAPER_KEY, currentWallpaper)
     }
 
     override fun onRestoreInstanceState(savedInstanceState: Bundle) {
@@ -235,15 +289,21 @@ open class ViewerActivity : BaseWallpaperApplierActivity<Preferences>() {
         return super.onOptionsItemSelected(item)
     }
 
-    override fun finish() {
-        imageView?.setZoom(1F)
+    private fun setViewerResult() {
         setResult(
             if (favoritesModified) FAVORITES_MODIFIED_RESULT
             else FAVORITES_NOT_MODIFIED_RESULT,
             Intent().apply {
                 putExtra(FAVORITES_MODIFIED, favoritesModified)
+                putExtra(CURRENT_WALLPAPER_URL_EXTRA, currentWallpaper?.url)
+                putExtra(CURRENT_WALLPAPER_IN_FAVORITES_EXTRA, isInFavorites)
             }
         )
+    }
+
+    override fun finish() {
+        imageView?.setZoom(1F)
+        setViewerResult()
         super.finish()
     }
 
@@ -299,9 +359,7 @@ open class ViewerActivity : BaseWallpaperApplierActivity<Preferences>() {
         val wallpaperFromIntent = intent?.extras?.getParcelable<Wallpaper?>(WALLPAPER_EXTRA)?.url
         try {
             if (wallpaperFromIntent == wallpaper.url) {
-                openFileInput(SHARED_IMAGE_NAME)?.use {
-                    placeholder = BitmapDrawable(resources, it)
-                }
+                placeholder = cachedCardImage(wallpaper)
             } else {
                 imageView?.dispose()
                 placeholder = Color.TRANSPARENT.toDrawable()
@@ -323,6 +381,59 @@ open class ViewerActivity : BaseWallpaperApplierActivity<Preferences>() {
                 imageView?.resetZoomAnimated()
             }
             generatePalette(w)
+            preloadAdjacentWallpapers()
+        }
+    }
+
+    /**
+     * The image the grid card was showing, so the transition starts with it. Comes from the
+     * memory cache when possible, else from the disk cache, and never from the network.
+     */
+    private fun cachedCardImage(wallpaper: Wallpaper): Drawable? {
+        val keys = listOfNotNull(wallpaper.thumbnail?.takeIf { it.hasContent() }, wallpaper.url)
+            .distinct()
+        keys.firstNotNullOfOrNull { imageLoader.memoryCache?.get(MemoryCache.Key(it))?.image }
+            ?.let { return it.asDrawable(resources) }
+        // Only reached without a memory cache hit, e.g. after process death
+        val metrics = resources.displayMetrics
+        return keys.firstNotNullOfOrNull { key ->
+            val request = ImageRequest.Builder(this)
+                .data(key)
+                .networkCachePolicy(CachePolicy.DISABLED)
+                .size(metrics.widthPixels, metrics.heightPixels)
+                .build()
+            (imageLoader.executeBlocking(request) as? SuccessResult)?.image
+        }?.asDrawable(resources)
+    }
+
+    /**
+     * Loads the previous and next wallpapers at the viewer's size, so an arrow tap shows them
+     * from the memory cache. Skipped on metered networks, as they might never be viewed, and on
+     * low-RAM devices, as each one can take tens of MB of memory.
+     */
+    private fun preloadAdjacentWallpapers() {
+        val current = currentWallpaper ?: return
+        if (preloadedNeighborsOf == current.url || isActiveNetworkMetered()) return
+        if (getSystemService(ActivityManager::class.java)?.isLowRamDevice == true) return
+        val width = imageView?.width ?: 0
+        val height = imageView?.height ?: 0
+        if (width <= 0 || height <= 0) return
+        val neighbors =
+            listOfNotNull(getAdjacentWallpaper(next = true), getAdjacentWallpaper(next = false))
+                .filter { it.url != current.url }
+                .distinctBy { it.url }
+        if (neighbors.isEmpty()) return
+        preloadedNeighborsOf = current.url
+        neighbors.forEach {
+            imageLoader.enqueue(
+                ImageRequest.Builder(this)
+                    .data(it.url)
+                    .size(width, height)
+                    // The viewer's TouchImageView loads with FILL. A FIT decode is smaller, and
+                    // the memory cache would not use it for the viewer's request
+                    .scale(Scale.FILL)
+                    .build()
+            )
         }
     }
 
@@ -374,6 +485,9 @@ open class ViewerActivity : BaseWallpaperApplierActivity<Preferences>() {
                     this.favoritesModified = true
                     if (isInFavorites) removeFromFavorites(wallpaper)
                     else addToFavorites(wallpaper)
+                    // Updated now instead of waiting for the database, so going back right away
+                    // already shows the new state. The favorites observer corrects it if it failed
+                    if (canShowFavoritesButton()) isInFavorites = !isInFavorites
                 } else onFavoritesLocked()
             }
         }
@@ -442,7 +556,7 @@ open class ViewerActivity : BaseWallpaperApplierActivity<Preferences>() {
         boolean(R.bool.show_wallpaper_palette_details, true)
 
     open fun shouldShowDownloadOption() = true
-    override fun shouldLoadCollections(): Boolean = false
+    override fun shouldLoadCollections(): Boolean = collectionName != null
     override val shouldChangeStatusBarLightStatus: Boolean = false
     override val shouldChangeNavigationBarLightStatus: Boolean = false
 
@@ -451,12 +565,16 @@ open class ViewerActivity : BaseWallpaperApplierActivity<Preferences>() {
 
     companion object {
         internal const val MIN_TIME: Long = 3L * 60L * 60000L
+        internal const val SEARCH_QUERY = "search_query"
+        internal const val CURRENT_WALLPAPER_URL_EXTRA = "current_wallpaper_url"
+        internal const val CURRENT_WALLPAPER_IN_FAVORITES_EXTRA = "current_wallpaper_in_favorites"
         internal const val FAVORITES_MODIFIED = "favorites_modified"
         internal const val FAVORITES_MODIFIED_RESULT = 1
-        internal const val FAVORITES_NOT_MODIFIED_RESULT = 0
+        // Not RESULT_CANCELED (0): Android skips onActivityReenter for it, and the list needs that
+        // callback to return the transition to the wallpaper the viewer ended on
+        internal const val FAVORITES_NOT_MODIFIED_RESULT = RESULT_OK
         internal const val LICENSE_CHECK_ENABLED = "license_check_enabled"
         internal const val CAN_TOGGLE_SYSTEMUI_VISIBILITY_KEY = "can_toggle_visibility"
-        internal const val SHARED_IMAGE_NAME = "thumb.jpg"
         internal const val TRANSITION_NAME = "wallpaper_transition_container"
         internal const val IS_FOR_FAVS = "viewer_is_for_favs"
         private const val ENTER_TRANSITION_DURATION = 300L
@@ -464,5 +582,6 @@ open class ViewerActivity : BaseWallpaperApplierActivity<Preferences>() {
         private const val CLOSING_KEY = "closing"
         private const val TRANSITIONED_KEY = "transitioned"
         private const val IS_IN_FAVORITES_KEY = "is_in_favorites"
+        private const val CURRENT_WALLPAPER_KEY = "current_wallpaper"
     }
 }
